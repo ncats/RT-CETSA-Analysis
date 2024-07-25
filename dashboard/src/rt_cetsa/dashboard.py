@@ -1,35 +1,46 @@
-from math import ceil
-from typing import IO
-from pydantic_core import from_json
-import solara
-from solara.components.file_drop import FileInfo
-from solara.lab import Ref
-from itertools import product
-
-from dataclasses import asdict, dataclass, replace
-from functools import partial
-from zipfile import ZipFile
-from pathlib import Path
-
-from tifffile import TiffFile, imread, imwrite
-from io import BytesIO
-import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
-import filepattern
-import pandas as pd 
-import shutil
-from solara.lab import task
-import numpy as np
-
-from polus.tabular.transforms.rt_cetsa_metadata import preprocess_metadata, preprocess_from_range
-from polus.images.segmentation.rt_cetsa_plate_extraction import extract_plates
-from polus.images.segmentation.rt_cetsa_plate_extraction.core import PlateParams, PLATE_DIMS
-from polus.images.features.rt_cetsa_intensity_extraction import alphanumeric_row, extract_signal
-from polus.tabular.regression.rt_cetsa_moltenprot import run_moltenprot_fit
-from polus.tabular.regression.rt_cetsa_analysis.run_rscript import run_rscript
-from polus.tabular.regression.rt_cetsa_analysis.preprocess_data import preprocess_data as analysis_preprocess_data
+# pylint: disable=W0621, W1203, W1309, C0116, E0611, E1129
 import logging
 import os
+import shutil
+from dataclasses import asdict, dataclass, replace
+from functools import partial
+from io import BytesIO
+from itertools import product
+from math import ceil
+from pathlib import Path
+from typing import IO, Any, Callable, Optional
+from zipfile import ZipFile
+
+import filepattern
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import reacton.ipyvuetify as rv
+import solara
+from matplotlib.colors import LinearSegmentedColormap, rgb2hex
+from matplotlib.patches import Circle
+from polus.images.features.rt_cetsa_intensity_extraction import (
+    alphanumeric_row,
+    extract_signal,
+)
+from polus.images.segmentation.rt_cetsa_plate_extraction import extract_plates
+from polus.images.segmentation.rt_cetsa_plate_extraction.core import (
+    PLATE_DIMS,
+    PlateParams,
+)
+from polus.tabular.regression.rt_cetsa_analysis.preprocess_data import (
+    preprocess_data as analysis_preprocess_data,
+)
+from polus.tabular.regression.rt_cetsa_analysis.run_rscript import run_rscript
+from polus.tabular.regression.rt_cetsa_moltenprot import run_moltenprot_fit
+from polus.tabular.transforms.rt_cetsa_metadata import (
+    preprocess_from_range,
+    preprocess_metadata,
+)
+from pydantic_core import from_json
+from solara.components.file_drop import FileInfo
+from solara.lab import Ref, task
+from tifffile import TiffFile, imread, imwrite
 
 # get env
 POLUS_LOG = os.environ.get("POLUS_LOG", logging.INFO)
@@ -91,6 +102,7 @@ class State:
     img_files: list of paths to images.
     
     """
+    tab_index: int
     raw_images: list[Path]
     camera_data: Path
     preprocessed_img_files: list[Path]
@@ -108,6 +120,7 @@ class State:
     plate_display: bytes | None
     plot_display: bytes | None 
     params: PlateParams | None
+    selected_well: str | None
     status_step1: str
     status_step2: str
     status_step2_1: str
@@ -165,8 +178,12 @@ def update_range_max_temp(state: solara.Reactive[State] , value: int):
     logger.info(f"updated range max temp to {value}")
 
 def update_use_range_temp(state: solara.Reactive[State] , value: bool): 
-    state.value = replace(state.value, use_range_temp = value)
+    state.value = replace(state.value, use_range_temp = value, status_step2_1="Using temp range.")
     logger.info(f"use range temp : {value}")
+
+def update_use_range_temp_false(state: solara.Reactive[State], value: bool): # pylint: disable=unused-argument
+    state.value = replace(state.value, use_range_temp = False, status_step2_1="Please drag and drop the camera data file.")
+    logger.info(f"use range temp : False")
 
 @task
 async def run_moltenprot(state: solara.Reactive[State]):
@@ -285,7 +302,8 @@ def  select_moltenprot_well(state: solara.Reactive[State], col: str, row: str):
     well, plot_display = render_moltenprot_plot(state, seq_position=row)
     state.value = replace(state.value,
                           status_step4=f"Well selected: ({well})",
-                          plot_display=plot_display
+                          plot_display=plot_display,
+                          selected_well=well
                           )
 
 def  select_grid_well(state: solara.Reactive[State], row: str, col: str):
@@ -297,7 +315,8 @@ def  select_grid_well(state: solara.Reactive[State], row: str, col: str):
     well, plot_display = render_moltenprot_plot(state, seq_position=well_index)
     state.value = replace(state.value,
                           status_step4=f"Well selected: ({well})",
-                          plot_display=plot_display
+                          plot_display=plot_display,
+                          selected_well=well
                           )
 
 
@@ -380,8 +399,10 @@ def save_image(filename: str, content : IO[bytes], state: solara.Reactive[State]
     imwrite(RAW_DIR / filename, image)
     state.value = replace(state.value, status_step1=f"Saved: {filename} [{progress}%]")
 
+show_files_step1: solara.Reactive[bool] = solara.reactive(True)
+upload_complete_step1: solara.Reactive[bool] = solara.reactive(False)
 
-def upload(files: list[FileInfo], state: solara.Reactive[State], upload_progress: solara.lab.Ref):
+def upload(files: list[FileInfo], state: solara.Reactive[State], upload_progress: solara.lab.Ref, on_complete: Optional[Callable] = None):
     upload_progress.value = False
     state.value = replace(state.value, status_step1=f"Upload Completed")
 
@@ -412,10 +433,14 @@ def upload(files: list[FileInfo], state: solara.Reactive[State], upload_progress
             save_image(filename, content, state, save_progress)
             current_file_index += 1
 
-        raw_images = list(RAW_DIR.iterdir())
-        state.value = replace(state.value,raw_images= raw_images ,status_step1=f"Done uploading images...")
-        upload_progress.value = False
-        logger.info(f"Done uploading images...")
+        logger.info(f"Progress {save_progress}%")
+
+    raw_images = list(RAW_DIR.iterdir())
+    state.value = replace(state.value,raw_images= raw_images ,status_step1=f"Done uploading images...")
+    upload_progress.value = False
+    logger.info(f"Done uploading images...")
+    if on_complete:
+        on_complete()
 
 def upload_plate_params(file: FileInfo, state: solara.Reactive[State], upload_progress: solara.lab.Ref):
     if not file['name'].endswith(".xlsx"):
@@ -435,12 +460,16 @@ def upload_camera_data(file: FileInfo, state: solara.Reactive[State], upload_pro
         logger.info("Camera data uploaded successfully.")
         state.value = replace(state.value, camera_data= CAMERA_DATA_FILE.resolve() , status_step2_1="Camera data uploaded successfully.")
 
+def set_tab_index(index: int, state: solara.Reactive[State]):
+    state.value = replace(state.value, tab_index=index)
+
+def get_id_index(state: solara.Reactive[State], id_: str):
+    return state.value.params_df["ID"].to_list().index(id_)
 
 
 @solara.component
 def DeleteStepData(state: solara.Reactive[State], step_index: int):
     open_delete_confirmation = solara.reactive(False)
-    
     with solara.Row():
         solara.Button(
             icon_name="mdi-delete",
@@ -489,6 +518,7 @@ def delete_all_data(state: solara.Reactive[State], step_index: int):
 
 def init_state():
     """Set up state when dashboad is loaded."""
+    tab_index = 0
     #step1
     raw_images = list(RAW_DIR.iterdir())
 
@@ -509,6 +539,7 @@ def init_state():
     if PLATE_PARAMS_FILE.exists():
         with PLATE_PARAMS_FILE.open("r") as f:
             params = PlateParams(**from_json(f.read()))
+    selected_well = None
     camera_data = None
     if CAMERA_DATA_FILE.exists():
         camera_data = CAMERA_DATA_FILE.resolve()
@@ -544,7 +575,7 @@ def init_state():
     if METADATA_FILE.exists():
         platemap = METADATA_FILE.resolve()
 
-    status_step1: str = "" if raw_images else "please upload some data..."
+    status_step1: str = "" if raw_images else "Please upload some data..."
     status_step2_1: str = "" if camera_data else "Please drag and drop the camera data file."
     status_step2: str = ""
     status_step3: str = "" 
@@ -552,6 +583,7 @@ def init_state():
     status_step5: str = "" 
 
     return State(
+        tab_index = tab_index,
         raw_images = raw_images,
         preprocessed_img_files = preprocessed_img_files,
         img_files = img_files,
@@ -560,6 +592,7 @@ def init_state():
         plate_display=None,
         plot_display=None,
         params= params,
+        selected_well= selected_well,
         intensities_df = intensities_df,
         moltenprot_fit_params = moltenprot_fit_params,
         range_temp = range_temp,
@@ -584,10 +617,12 @@ state = solara.reactive(init_state())
 def Page():
 
     # NOTE Use that mechanism or update global state directly
+    tab_index = Ref(state.fields.tab_index)
     upload_progress = Ref(state.fields.upload_progress)
     platemap_upload_progress = Ref(state.fields.platemap_upload_progress)
     camera_upload_progress = Ref(state.fields.camera_upload_progress)
     plate_display = Ref(state.fields.plate_display)
+    selected_well = Ref(state.fields.selected_well)
 
     show_step1 : bool = True
     show_step2 : bool = len(state.value.raw_images) > 0
@@ -597,13 +632,14 @@ def Page():
     show_run_analysis: bool = show_step4 and state.value.platemap is not None
 
     with solara.Column(align="center"):
-        with solara.lab.Tabs():
+        with solara.lab.Tabs(value=tab_index):
             """Step 1
             
             Upload images.
             output : img_files
             """
-            with solara.lab.Tab("1/ Upload", disabled=not show_step1):
+            with solara.lab.Tab("1/ Upload", disabled=not show_step1, tab_children=[DeleteStepData(state=state, step_index=1)
+] if tab_index.value == 0 else []):
                 with solara.Card(title="Step 1: Upload data"):
                     solara.Markdown(r'''
                                     
@@ -612,33 +648,51 @@ def Page():
                         * You can delete all uploaded images by clicking on the trash icon.
 
                         ''')
-                    solara.FileDropMultiple(
-                        on_file=partial(upload, state=state, upload_progress=upload_progress),
-                        lazy=False,
-                        on_total_progress=upload_progress.set,
-                    )
-                    solara.Markdown(state.value.status_step1)
+                    def _set_progress(*args):
+                        state.value = replace(state.value,status_step1=f"Analyzing files...")
+                        upload_progress.set(True)
+
+                    def on_upload_complete():
+                        upload_complete_step1.set(True)
+                        show_files_step1.set(False)
+
+                    if show_files_step1.value:
+                        solara.FileDropMultiple(
+                            on_file=partial(upload, state=state, upload_progress=upload_progress, on_complete=on_upload_complete),
+                            lazy=False,
+                            on_total_progress=_set_progress,
+                        )
+
+                    if state.value.status_step1 == "Done uploading images...":
+                        solara.Success(state.value.status_step1)
+                    else:
+                        solara.Markdown(state.value.status_step1)
                     solara.ProgressLinear(upload_progress.value)
+                    if state.value.status_step1 == "Done uploading images...":
+                        show_files_step1.set(True)
                     
                     with solara.CardActions():
                         with solara.Row():
                             solara.Markdown(f"{len(state.value.raw_images)} images uploaded.")
-                            DeleteStepData(state=state, step_index=1)
                 
-                with solara.Card():
-                    raw_images = state.value.raw_images
-                    if len(raw_images) > 0:
-                            num_col = 8
-                            batch_len = ceil(len(raw_images) / num_col)
-                            with solara.GridFixed(columns=num_col):
-                                for col in range(0,num_col):
-                                    with solara.Column():
-                                        for file in raw_images[col * batch_len : min((col+1)*batch_len, len(raw_images))]:
-                                            solara.HTML(unsafe_innerHTML=f"{file.name}")
+                if len(state.value.raw_images) > 0:
+                    with solara.Card():
+                        raw_images = state.value.raw_images
+                        if len(raw_images) > 0:
+                                num_col = 8
+                                batch_len = ceil(len(raw_images) / num_col)
+                                with solara.GridFixed(columns=num_col):
+                                    for col in range(0,num_col):
+                                        with solara.Column():
+                                            for file in raw_images[col * batch_len : min((col+1)*batch_len, len(raw_images))]:
+                                                solara.HTML(unsafe_innerHTML=f"{file.name}")
+                    solara.Button(label="Next Step", on_click=partial(set_tab_index, 1, state),
+                                    style={"margin": "8px", "background-color": "#6aa7f7"})
                                 
 
             """Step 2"""
-            with solara.lab.Tab("2/ Preprocess Plates", disabled=not show_step2):
+            with solara.lab.Tab("2/ Preprocess Plates", disabled=not show_step2, tab_children=[DeleteStepData(state=state, step_index=2)
+] if tab_index.value == 1 else []):
                 solara.Markdown(r'''
                     * In this step, we preprocess plate images:        
                         * Crop and rotate plate image.
@@ -647,26 +701,45 @@ def Page():
                     * Image and detected wells are displayed for sanity check.
                     ''')
                 with solara.Card(title="Step 2.1: Preprocess data"):
-                    solara.Markdown(state.value.status_step2_1)
-                    solara.FileDrop(
-                        label="Drag and drop camera data file.",
-                        on_file=partial(upload_camera_data, state=state, upload_progress=camera_upload_progress),
-                        lazy=False,
-                        on_total_progress=camera_upload_progress.set
-                    )
-                    solara.Markdown("OR")
-                    solara.Checkbox(label="Use Temp Range", value=state.value.use_range_temp , on_value=partial(update_use_range_temp,state))
-                    with solara.Row(gap="2px", margin="2px", justify="center"):
-                        solara.InputFloat(
-                            label="min_temp",
-                            disabled=not state.value.use_range_temp,
-                            value=state.value.range_temp[0],
-                            on_value=partial(update_range_min_temp, state))
-                        solara.InputFloat(
-                            label="max_temp",
-                            disabled=not state.value.use_range_temp,
-                            value=state.value.range_temp[1],
-                            on_value=partial(update_range_max_temp, state))
+                    with solara.Columns():
+                        with solara.Column(style={"color": "#e3e3e3" if state.value.use_range_temp else "black",
+                                                  "background-color": "white" if state.value.use_range_temp else "#fafafa"}):
+                            solara.Checkbox(label="Upload Camera Data File", value=not state.value.use_range_temp , on_value=partial(update_use_range_temp_false,state))
+                            solara.FileDrop(
+                                label="Drag and drop camera data file.",
+                                on_file=partial(upload_camera_data, state=state, upload_progress=camera_upload_progress),
+                                lazy=False,
+                                on_total_progress=camera_upload_progress.set
+                            )
+                        with solara.Column(style={"background-color": "#fafafa" if state.value.use_range_temp else "white"}):
+                            solara.Checkbox(label="Use Temp Range", value=state.value.use_range_temp , on_value=partial(update_use_range_temp,state))
+                            with solara.Row(gap="2px", margin="2px", justify="center",
+                                            style={"background-color": "#fafafa" if state.value.use_range_temp else "white"}):
+                                solara.InputFloat(
+                                    label="min_temp",
+                                    disabled=not state.value.use_range_temp,
+                                    value=state.value.range_temp[0],
+                                    on_value=partial(update_range_min_temp, state))
+                                solara.InputFloat(
+                                    label="max_temp",
+                                    disabled=not state.value.use_range_temp,
+                                    value=state.value.range_temp[1],
+                                    on_value=partial(update_range_max_temp, state))
+                            solara.Row(justify="center",
+                                        style={"background-color": "#fafafa" if state.value.use_range_temp else "white",
+                                               "height": "53px"})
+                    if not state.value.use_range_temp:
+                        if not preprocess_images.error:
+                            if state.value.status_step2_1 == "Images preprocessed.":
+                                solara.Success(state.value.status_step2_1)
+                            else:
+                                solara.Markdown(state.value.status_step2_1)
+                    else:
+                        if not preprocess_images.error and state.value.status_step2_1 != "Please drag and drop the camera data file.":
+                            if state.value.status_step2_1 == "Images preprocessed.":
+                                solara.Success(state.value.status_step2_1)
+                            else:
+                                solara.Markdown(state.value.status_step2_1)
                     solara.ProgressLinear(camera_upload_progress.value)
                     solara.ProgressLinear(preprocess_images.pending)
                     
@@ -676,7 +749,6 @@ def Page():
                                 label="Preprocess images",
                                 on_click=partial(preprocess_images,state),
                             )
-                            DeleteStepData(state=state, step_index=2)
 
                     if preprocess_images.error:
                         state.value = replace(state.value, status_step2_1=str(preprocess_images.exception))
@@ -684,7 +756,12 @@ def Page():
 
                 with solara.Card(title="Step 2: Preview data"):
                     
-                    solara.Markdown(state.value.status_step2)
+                    if extract_plate_params.error:
+                        solara.Error(state.value.status_step2)
+                    elif state.value.status_step2 == "Plate images cropped and rotated.":
+                        solara.Success(state.value.status_step2)
+                    else:
+                        solara.Markdown(state.value.status_step2)
                     solara.ProgressLinear(extract_plate_params.pending)
 
                     with solara.CardActions():
@@ -692,36 +769,45 @@ def Page():
                             solara.Button(
                                 label="Extract Plate Params",
                                 on_click=partial(extract_plate_params,state),
+                                disabled= not state.value.status_step2_1 == "Images preprocessed."
                             )
-                            DeleteStepData(state=state, step_index=2)
 
                     if extract_plate_params.error:
                         state.value = replace(state.value, status_step2=str(extract_plate_params.exception))
                     
-                with solara.Card():
-                    if len(state.value.img_files) > 0 :
-                        solara.SliderInt(
-                            "Select image",
-                            min=1,
-                            max=len(state.value.img_files),
-                            on_value=partial(show_plate, state)
-                        )
+                if state.value.status_step2 == "Plate images cropped and rotated.":
+                    with solara.Card():
+                        if len(state.value.img_files) > 0 :
+                            solara.SliderInt(
+                                "Select image",
+                                min=1,
+                                max=len(state.value.img_files),
+                                on_value=partial(show_plate, state)
+                            )
 
-                    if plate_display.value is not None:
-                        solara.Image(plate_display.value)
+                        if plate_display.value is not None:
+                            solara.Image(plate_display.value)
+                    solara.Button(label="Next Step", on_click=partial(set_tab_index, 2, state),
+                                    style={"margin": "8px", "background-color": "#6aa7f7"})
 
             """Step 3"""
-            with solara.lab.Tab("3/ Extract well intensities", disabled=not show_step3):
+            with solara.lab.Tab("3/ Extract well intensities", disabled=not show_step3, tab_children=[DeleteStepData(state=state, step_index=3)
+] if tab_index.value == 2 else []):
                 with solara.Card(title="Step 3: Extract well intensities"):
                     solara.Markdown(r'''
                         * Extract plate intensities.
                         * Once completed, a dataframe collecting the well intensities will be displayed.
                         ''')
                     
-                    solara.Markdown(state.value.status_step3)
-                    solara.ProgressLinear(extract_intensities.pending)
-                    if extract_intensities.error:
+                    if not extract_intensities.error and state.value.status_step3 == "Well intensities extracted.":
+                        solara.Success(state.value.status_step3)
+                    elif extract_intensities.error:
                         state.value = replace(state.value, status_step3=str(extract_intensities.exception))
+                        solara.Error(state.value.status_step3)
+                    else:
+                        solara.Markdown(state.value.status_step3)
+                    
+                    solara.ProgressLinear(extract_intensities.pending)
 
                     with solara.CardActions():
                         with solara.Row():
@@ -729,17 +815,29 @@ def Page():
                                 label="Extract Intensities",
                                 on_click=partial(extract_intensities,state),
                             )                        
-                            DeleteStepData(state=state, step_index=3)
 
                 if state.value.intensities_df is not None:
                     with solara.Card():
-                        solara.DataFrame(state.value.intensities_df, scrollable=True)
+                        def return_df_headers_step3():
+                            headers_ = [{"text": col, "value": col, "align": "left"} for col in state.value.intensities_df.columns.to_list()]
+                            return headers_
+                        rv.DataTable(items=state.value.intensities_df.to_dict("records"),
+                                    headers=return_df_headers_step3(),
+                                    items_per_page=-1,
+                                    hide_default_footer=True,
+                                    height="calc(100vh - 300px)",
+                                    fixed_header=True,
+                                    dense=True,
+                        )
+                    solara.Button(label="Next Step", on_click=partial(set_tab_index, 3, state),
+                                    style={"margin": "8px", "background-color": "#6aa7f7"})
 
             """Step 4"""
-            with solara.lab.Tab("4/ Run Moltenprot", disabled=not show_step4):
+            with solara.lab.Tab("4/ Run Moltenprot", disabled=not show_step4, tab_children=[DeleteStepData(state=state, step_index=4)
+] if tab_index.value == 3 else []):
                 with solara.Card(title="Step 4: Run Moltenprot"):
                     solara.Markdown(r'''
-                        * Run moltenprot and extract model parameters.
+                        Run moltenprot and extract model parameters.
                         ''')
                     with solara.Row(gap="2px", margin="2px", justify="center"):
                         solara.InputInt(
@@ -768,49 +866,131 @@ def Page():
                             on_value=partial(update_moltenprot_params, state, "baseline_bounds")
                         )
                     
-                    solara.Markdown(state.value.status_step4)
-                    solara.ProgressLinear(run_moltenprot.pending)
+                    if not run_moltenprot.error and state.value.status_step4 == "Moltenprot fit completed.":
+                        solara.Success(state.value.status_step4)
+                    elif run_moltenprot.error:
+                        state.value = replace(state.value, status_step4=str(run_moltenprot.exception))
+                        solara.Error(state.value.status_step4)
+                    else:
+                        solara.Markdown(state.value.status_step4)
                     if run_moltenprot.error:
                         state.value = replace(state.value, status_step4=str(run_moltenprot.exception))
+                    solara.ProgressLinear(run_moltenprot.pending)
 
                     with solara.CardActions():
                         with solara.Row(gap="2px", margin="2px", justify="center"):
                             solara.Button("Run Moltenprot", on_click=partial(run_moltenprot,state))
-                            DeleteStepData(state=state, step_index=4)
 
-                if state.value.params_df is not None:
-                    with solara.Card("Well Plate"):    
+                if state.value.params_df is not None: 
+                    def get_bs_factor(coords: str):
+                        return state.value.params_df[state.value.params_df["ID"] == coords]["BS_factor"].to_numpy()[0]
+                    
+                    def color_mapping(x: float) -> float:
+                        if x <= 0.8:
+                            return 0.0
+                        if x <= 1.0:
+                            return (x - 0.8) / 0.2
+                        else:
+                            return 1.0
+
+                    def get_color(colors: LinearSegmentedColormap, coords: str):
+                        bs_factor = get_bs_factor(coords)
+                        return rgb2hex(colors(color_mapping(bs_factor)))
+
+                    with solara.Card("Well Plate"):
                         with solara.Row():
                             if state.value.plot_display is not None:
                                 solara.Image(state.value.plot_display)  
 
                             dims = PLATE_DIMS[state.value.params.size]
-                            with solara.GridFixed(columns=len(state.value.params.X)):
-                                for row in range(len(state.value.params.Y)):
-                                    for col in range(len(state.value.params.X)):
-                                        coords =  alphanumeric_row(row=row, col=col, dims=dims)
-                                        solara.Button(
-                                            coords,
-                                            outlined=False,
-                                            text=True,
-                                            on_click=partial(select_grid_well, state, row, col),
-                                            style={"font-size": "8px", "width" :"10px", "height":"10px", "padding": "0px"}
-                                        )
+                            with solara.Div(style={"padding": "1.6%"}):
+                                colors = LinearSegmentedColormap.from_list('colors', [
+                                    (0.0, '#fa0000'),
+                                    (0.5, '#008000'),
+                                    (1.0,'#00fa00')
+                                    ], N=512)
+
+                                with solara.GridFixed(columns=len(state.value.params.X), align_items="self-start", justify_items="center"):
+                                    for row in range(len(state.value.params.Y)):
+                                        for col in range(len(state.value.params.X)):
+                                            coords =  alphanumeric_row(row=row, col=col, dims=dims)
+                                            solara.Button(
+                                                coords,
+                                                outlined=False,
+                                                text=True,
+                                                on_click=partial(select_grid_well, state, row, col),
+                                                style={"font-size": "8px", "width" :"fit-content", "height":"fit-content", "padding": "0px",
+                                                    "background-color": get_color(colors, coords), "margin": "0px", "display": "inline-block",
+                                                    "border-radius": "0", "border": "none", "justify-content": "center"}
+                                            )
+
+                        def return_df_headers_step4_1():
+                            headers_ = [{"text": col, "value": col, "align": "left"} for col in state.value.params_df.columns.to_list()]
+                            headers_[0] = {**headers_[0], "width": "70px"} # ID
+                            dhm_init_index = state.value.params_df.columns.to_list().index("dHm_init") 
+                            headers_[dhm_init_index] = {**headers_[dhm_init_index], "width": "100px"} # BS_factor
+                            return headers_
+
+                        if state.value.plot_display is not None:
+                            items_ = [x for x in state.value.params_df.to_dict("records") if x["ID"] == selected_well.value]
+                            rv.DataTable(
+                                items=items_,
+                                headers=return_df_headers_step4_1(),
+                                hide_default_footer=True,
+                                disable_sort=True,
+                            )
+                    # NOTE: this is informative but Solara is too slow at rendering this
+                    # and it is not a good user experience
+                    # color_display_html = colors._repr_html_().replace("under", "0.8").replace("over", "1.0").replace("colors", "").replace('<div style="margin: 0 auto; display: inline-block;">bad <div title="#00000000" style="display: inline-block; width: 1em; height: 1em; margin: 0; vertical-align: middle; border: 1px solid #555; background-color: #00000000;"></div></div>', "")
+                    # heatmap_colors = [solara.Markdown("## BS Factor Color Mapping"), solara.HTML(unsafe_innerHTML=color_display_html)]
+                    # solara.Details(summary="See Color Mapping", children=heatmap_colors, expand=False)
 
                     with solara.Card("Fit Params"):
-                        cell_actions = [solara.CellAction(icon="mdi-chart-bell-curve-cumulative",name='view', on_click=partial(select_moltenprot_well, state))]
-                        solara.DataFrame(state.value.params_df, scrollable=True, cell_actions=cell_actions)
+                        def select_row(x: Any, y: Any, z: dict): # pylint: disable=unused-argument
+                            id_ = z["ID"]
+                            row_num = get_id_index(state, id_)
+                            select_moltenprot_well(state, "0", row_num)
+                        multi_sort, set_multi_sort = solara.use_state(False)
+                        with solara.Row(justify="end"):
+                            solara.Switch(label="Multi Sort", value=multi_sort, on_value=set_multi_sort)
+                        data_table = rv.DataTable(items=state.value.params_df.to_dict("records"),
+                                    headers=return_df_headers_step4_1(),
+                                    items_per_page=-1,
+                                    multi_sort=multi_sort,
+                                    hide_default_footer=True,
+                                    height="calc(100vh - 300px)",
+                                    fixed_header=True,
+                                    dense=True,
+                        )
+                        rv.use_event(data_table, "click:row", select_row)
+                        
+
+                    def return_df_headers_step4_2():
+                        headers_ = [{"text": col, "value": col, "align": "left"} for col in state.value.values_df.columns.to_list()]
+                        headers_[0] = {**headers_[0], "width": "125px"} # Temperature
+                        return headers_
                     with solara.Card("Baseline Corrected"):
-                        solara.DataFrame(state.value.values_df, scrollable=True)
+                        rv.DataTable(items=state.value.values_df.to_dict("records"),
+                                    headers=return_df_headers_step4_2(),
+                                    items_per_page=-1,
+                                    hide_default_footer=True,
+                                    height="calc(100vh - 300px)",
+                                    fixed_header=True,
+                                    dense=True,
+                        )
+                    solara.Button(label="Next Step", on_click=partial(set_tab_index, 4, state),
+                                    style={"margin": "8px", "background-color": "#6aa7f7"})
 
                     
             """Step 5"""
-            with solara.lab.Tab("5/ Run Analysis", disabled=not show_step5):
+            with solara.lab.Tab("5/ Run Analysis", disabled=not show_step5, tab_children=[DeleteStepData(state=state, step_index=5)
+] if tab_index.value == 4 else []):
                 solara.Markdown(r'''
-                    * Run statistical analysis :
-                        * A platemap need to be uploaded first.
-                        * When completed, a result dataframe will be displayed.
-                    ''')
+                    ## Run statistical analysis :
+                    * A platemap needs to be uploaded first.
+                    * When completed, a result dataframe will be displayed.
+                    ''',
+                    style={"margin": "8px"})
                 with solara.Card(title="Step 5: Run Analysis"):
 
                     solara.Markdown(state.value.status_step5)
@@ -832,7 +1012,6 @@ def Page():
                         with solara.Row(gap="2px", margin="2px", justify="center"):
                             if show_run_analysis:
                                 solara.Button("Analyze", on_click=partial(run_analysis, state))
-                            DeleteStepData(state=state, step_index=5)
                 
                 if state.value.signif_df is not None:     
                     with solara.Card():
