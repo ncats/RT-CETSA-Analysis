@@ -1,4 +1,4 @@
-# RT_CETSA Dashboard (v0.3.0-dev0)
+# RT_CETSA Dashboard (v0.4.0-dev0)
 
 Web-based dashboard that manages a full RT_CETSA pipeline.
 
